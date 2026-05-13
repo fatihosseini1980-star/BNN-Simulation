@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# --- Clean VI diagram for BNN 
+# --- Clean VI diagram for BNN (English, 45° feed arrows) ---
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
@@ -1599,3 +1599,346 @@ df = pd.DataFrame({
                   })
 print("\n=== Metrics (rounded) ===")
 print(df.round(4))
+
+
+
+# -*- coding: utf-8 -*-
+
+import os
+import time
+import math
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+
+from sklearn.datasets import load_diabetes
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+
+torch.set_default_dtype(torch.float32)
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+# --------------------------------------------------
+# 1. Load Diabetes data
+# --------------------------------------------------
+
+data = load_diabetes(as_frame=True)
+X_df = data.data.copy()
+y_raw = data.target.to_numpy().astype(np.float32)
+X = X_df.to_numpy().astype(np.float32)
+
+X_train0, X_test, y_train0, y_test_raw = train_test_split(
+                                                          X, y_raw, test_size=0.25, random_state=42
+                                                          )
+
+# A smaller training subset was used to keep MCMC computation stable and fast.
+X_train, _, y_train_raw, _ = train_test_split(
+                                              X_train0, y_train0, train_size=180, random_state=42
+                                              )
+
+x_scaler = StandardScaler()
+y_scaler = StandardScaler()
+
+X_train_s = x_scaler.fit_transform(X_train).astype(np.float32)
+X_test_s = x_scaler.transform(X_test).astype(np.float32)
+y_train_s = y_scaler.fit_transform(y_train_raw.reshape(-1, 1)).ravel().astype(np.float32)
+
+Xtr = torch.tensor(X_train_s)
+ytr = torch.tensor(y_train_s)
+Xte = torch.tensor(X_test_s)
+
+n_train, d = Xtr.shape
+h = 3
+
+# Parameters:
+# W1: d*h, b1: h, W2: h, b2: 1, log_sigma: 1
+n_params = d * h + h + h + 1 + 1
+
+
+# --------------------------------------------------
+# 2. Bayesian neural network
+# --------------------------------------------------
+
+def unpack(theta):
+    idx = 0
+    
+    W1 = theta[idx:idx + d * h].reshape(d, h)
+    idx += d * h
+    
+    b1 = theta[idx:idx + h]
+    idx += h
+    
+    W2 = theta[idx:idx + h]
+    idx += h
+    
+    b2 = theta[idx]
+    idx += 1
+    
+    log_sigma = theta[idx]
+    
+    return W1, b1, W2, b2, log_sigma
+
+
+def forward(theta, X):
+    W1, b1, W2, b2, log_sigma = unpack(theta)
+    hidden = torch.tanh(X @ W1 + b1)
+    mu = hidden @ W2 + b2
+    sigma = torch.nn.functional.softplus(log_sigma) + 1e-4
+    return mu, sigma
+
+
+def log_posterior(theta):
+    mu, sigma = forward(theta, Xtr)
+    
+    resid = ytr - mu
+    n = ytr.numel()
+    
+    log_likelihood = -0.5 * torch.sum((resid / sigma) ** 2) - n * torch.log(sigma)
+    
+    log_prior_weights = -0.5 * torch.sum(theta[:-1] ** 2)
+    log_prior_sigma = -0.5 * ((theta[-1] + 1.0) ** 2)
+    
+    return log_likelihood + log_prior_weights + log_prior_sigma
+
+
+def grad_logp(theta):
+    th = theta.detach().clone().requires_grad_(True)
+    lp = log_posterior(th)
+    g = torch.autograd.grad(lp, th)[0]
+    return lp.detach(), g.detach()
+
+
+# --------------------------------------------------
+# 3. MAP initialization
+# --------------------------------------------------
+
+theta_map = torch.zeros(n_params, requires_grad=True)
+optimizer = torch.optim.Adam([theta_map], lr=0.025)
+
+for _ in range(500):
+    optimizer.zero_grad()
+    loss = -log_posterior(theta_map)
+    loss.backward()
+    optimizer.step()
+
+theta0 = theta_map.detach().clone()
+
+
+# --------------------------------------------------
+# 4. HMC
+# --------------------------------------------------
+
+def hmc_sample(theta_start, n_samples=90, burn=40, eps=0.012, L=8):
+    samples = []
+    accepts = 0
+    
+    theta = theta_start.clone()
+    total_iter = n_samples + burn
+    
+    start_time = time.time()
+    
+    for it in range(total_iter):
+        p0 = torch.randn_like(theta)
+        
+        current_theta = theta.clone()
+        current_p = p0.clone()
+        
+        lp0, g = grad_logp(theta)
+        
+        p = p0 + 0.5 * eps * g
+        theta_prop = theta.clone()
+        
+        for j in range(L):
+            theta_prop = theta_prop + eps * p
+            lp_prop, g_prop = grad_logp(theta_prop)
+            
+            if j != L - 1:
+                p = p + eps * g_prop
+
+    p = p + 0.5 * eps * g_prop
+        
+        H0 = -lp0 + 0.5 * torch.sum(current_p ** 2)
+        H1 = -lp_prop + 0.5 * torch.sum(p ** 2)
+        
+        acc_prob = torch.exp(torch.clamp(H0 - H1, max=0.0))
+        
+        if torch.rand(()) < acc_prob:
+            theta = theta_prop.detach()
+            accepts += 1
+        else:
+            theta = current_theta.detach()
+        
+        if it >= burn:
+            samples.append(theta.numpy().copy())
+
+runtime = time.time() - start_time
+acceptance_rate = accepts / total_iter
+    
+    return np.array(samples), acceptance_rate, runtime
+
+
+# --------------------------------------------------
+# 5. Variational inference
+# --------------------------------------------------
+
+def vi_sample(n_iter=1200, n_draws=180, lr=0.02):
+    mu = theta0.clone().detach().requires_grad_(True)
+    rho = torch.full((n_params,), -3.0, requires_grad=True)
+    
+    optimizer = torch.optim.Adam([mu, rho], lr=lr)
+    
+    start_time = time.time()
+    
+    for _ in range(n_iter):
+        optimizer.zero_grad()
+        
+        sigma_q = torch.nn.functional.softplus(rho) + 1e-5
+        eps = torch.randn(n_params)
+        
+        theta = mu + sigma_q * eps
+        
+        logp = log_posterior(theta)
+        logq = -0.5 * torch.sum(((theta - mu) / sigma_q) ** 2) - torch.sum(torch.log(sigma_q))
+        
+        loss = -(logp - logq)
+        loss.backward()
+        
+        optimizer.step()
+    
+    with torch.no_grad():
+        sigma_q = torch.nn.functional.softplus(rho) + 1e-5
+        draws = mu + sigma_q * torch.randn(n_draws, n_params)
+
+    runtime = time.time() - start_time
+
+return draws.numpy(), runtime
+
+
+# --------------------------------------------------
+# 6. Posterior prediction and metrics
+# --------------------------------------------------
+
+def predict_from_samples(samples):
+    preds = []
+    
+    with torch.no_grad():
+        for s in samples:
+            theta = torch.tensor(s)
+            mu_s, _ = forward(theta, Xte)
+            preds.append(mu_s.numpy())
+
+preds = np.array(preds)
+
+return y_scaler.inverse_transform(preds.T).T
+
+
+def summarize(samples, method, runtime, acceptance_rate=np.nan):
+    pred = predict_from_samples(samples)
+    
+    mean_pred = pred.mean(axis=0)
+    
+    rmse = math.sqrt(mean_squared_error(y_test_raw, mean_pred))
+    mae = mean_absolute_error(y_test_raw, mean_pred)
+    r2 = r2_score(y_test_raw, mean_pred)
+    
+    lower = np.percentile(pred, 2.5, axis=0)
+    upper = np.percentile(pred, 97.5, axis=0)
+    
+    coverage = np.mean((y_test_raw >= lower) & (y_test_raw <= upper))
+    mean_width = np.mean(upper - lower)
+    
+    return {
+        "Method": method,
+        "RMSE": rmse,
+        "MAE": mae,
+        "R2": r2,
+        "Coverage_95": coverage,
+        "Mean_width_95": mean_width,
+        "Acceptance_rate": acceptance_rate,
+        "Runtime_sec": runtime,
+        "Prediction_mean": mean_pred,
+        "Lower_95": lower,
+        "Upper_95": upper,
+}
+
+
+# --------------------------------------------------
+# 7. Run methods
+# --------------------------------------------------
+
+samples_hmc, acc_hmc, time_hmc = hmc_sample(theta0)
+samples_vi, time_vi = vi_sample()
+
+res_hmc = summarize(samples_hmc, "HMC", time_hmc, acc_hmc)
+res_vi = summarize(samples_vi, "VI", time_vi)
+
+results = [res_hmc, res_vi]
+
+metrics = pd.DataFrame([
+                        {
+                        "Method": r["Method"],
+                        "RMSE": r["RMSE"],
+                        "MAE": r["MAE"],
+                        "R2": r["R2"],
+                        "Coverage_95": r["Coverage_95"],
+                        "Mean_width_95": r["Mean_width_95"],
+                        "Acceptance_rate": r["Acceptance_rate"],
+                        "Runtime_sec": r["Runtime_sec"],
+                        }
+                        for r in results
+                        ])
+
+print(metrics.round(4))
+
+
+# --------------------------------------------------
+# 8. Normalized comparison plot
+# --------------------------------------------------
+
+plot_df = metrics[["Method", "RMSE", "MAE", "R2", "Runtime_sec"]].copy()
+
+plot_df["RMSE"] = plot_df["RMSE"] / plot_df["RMSE"].max()
+plot_df["MAE"] = plot_df["MAE"] / plot_df["MAE"].max()
+plot_df["R2"] = plot_df["R2"] / plot_df["R2"].max()
+plot_df["Runtime_sec"] = plot_df["Runtime_sec"] / plot_df["Runtime_sec"].max()
+
+x = np.arange(len(plot_df))
+w = 0.18
+
+plt.figure(figsize=(8, 5))
+
+plt.bar(x - 1.5 * w, plot_df["RMSE"], width=w, label="Normalized RMSE")
+plt.bar(x - 0.5 * w, plot_df["MAE"], width=w, label="Normalized MAE")
+plt.bar(x + 0.5 * w, plot_df["R2"], width=w, label="Normalized R2")
+plt.bar(x + 1.5 * w, plot_df["Runtime_sec"], width=w, label="Normalized runtime")
+
+plt.xticks(x, plot_df["Method"])
+plt.ylabel("Normalized metric value")
+plt.xlabel("Inference method")
+plt.title("Normalized comparison of HMC and VI on Diabetes data")
+
+plt.legend(
+           loc="upper center",
+           bbox_to_anchor=(0.5, -0.18),
+           ncol=2,
+           frameon=True
+           )
+
+plt.tight_layout()
+plt.savefig("comparison.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# --------------------------------------------------
+# 9. Save results
+# --------------------------------------------------
+
+metrics.to_csv("diabetes_hmc_vi_results.csv", index=False)
